@@ -27,6 +27,9 @@ output/
 .env
 .env.local
 
+# Claude Code (lokale Einstellungen nicht ins Repo)
+.claude/settings.local.json
+
 # Windows
 Thumbs.db
 Desktop.ini
