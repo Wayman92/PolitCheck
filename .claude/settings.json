@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py main.py fetch --help)",
+      "Bash(py main.py --help)",
+      "Bash(py main.py extract --help)",
+      "Bash(py main.py report --help)"
+    ]
+  }
+}

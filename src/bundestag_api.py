@@ -145,34 +145,37 @@ class BundestagAPI:
         datum_von: Optional[str] = None,
         datum_bis: Optional[str] = None,
         batch_size: int = 100,
+        max_results: Optional[int] = None,
         verbose: bool = True,
     ) -> list[dict]:
         """
-        Lädt **alle** Plenarprotokolle via Cursor-Pagination.
+        Lädt Plenarprotokolle via Cursor-Pagination.
 
         Die API liefert pro Request max. 100 Dokumente und einen `cursor`-Token
         für die nächste Seite. Diese Methode iteriert solange, bis kein Cursor
-        mehr zurückkommt.
+        mehr zurückkommt oder max_results erreicht ist.
 
         Args:
             wahlperiode: Wahlperiode (default: 20)
             datum_von:   Startdatum YYYY-MM-DD (optional)
             datum_bis:   Enddatum   YYYY-MM-DD (optional)
             batch_size:  Dokumente pro Request (max 100)
+            max_results: Maximale Gesamtanzahl (optional, default: alle)
             verbose:     Fortschrittsausgabe auf stdout
 
         Returns:
-            Liste aller Protokoll-Dicts direkt aus der API
+            Liste der Protokoll-Dicts direkt aus der API
         """
         alle: list[dict] = []
         cursor: Optional[str] = None
         seite = 1
 
         while True:
+            verbleibend = (max_results - len(alle)) if max_results else batch_size
             params: dict = {
                 "wahlperiode": wahlperiode,
                 "format": "json",
-                "num": batch_size,
+                "num": min(batch_size, verbleibend),
             }
             if datum_von:
                 params["datum.start"] = datum_von
@@ -189,7 +192,7 @@ class BundestagAPI:
                 print(f"  Seite {seite:>3} → {len(batch):>3} Protokolle  (gesamt: {len(alle)})")
 
             cursor = data.get("cursor")
-            if not batch or not cursor:
+            if not batch or not cursor or (max_results and len(alle) >= max_results):
                 break
 
             seite += 1
@@ -298,9 +301,10 @@ class ProtokollDatabase:
         Bereits vorhandene IDs werden übersprungen (INSERT OR IGNORE).
 
         Returns:
-            {"neu": int, "duplikate": int}
+            {"neu": int, "duplikate": int, "neue_dokumente": list[dict]}
+            wobei neue_dokumente die tatsächlich neu eingefügten Dicts enthält.
         """
-        neu = 0
+        neue_dokumente: list[dict] = []
         duplikate = 0
         jetzt = datetime.now().isoformat()
 
@@ -326,14 +330,14 @@ class ProtokollDatabase:
                     ),
                 )
                 if self.conn.execute("SELECT changes()").fetchone()[0] > 0:
-                    neu += 1
+                    neue_dokumente.append(dok)
                 else:
                     duplikate += 1
             except Exception as e:
                 print(f"  ⚠️  Fehler bei id={doc_id}: {e}")
 
         self.conn.commit()
-        return {"neu": neu, "duplikate": duplikate}
+        return {"neu": len(neue_dokumente), "duplikate": duplikate, "neue_dokumente": neue_dokumente}
 
     def get_protokolle(
         self,
