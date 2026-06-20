@@ -28,9 +28,10 @@ class Database:
                 aussage TEXT NOT NULL,
                 kontext TEXT,
                 thema TEXT,
+                kategorie TEXT DEFAULT 'polarisierend',
                 polarisierungsgrad INTEGER,
                 polarisierungsbegruendung TEXT,
-                sprachliche_extreme TEXT,  -- JSON-Array
+                sprachliche_extreme TEXT,
                 quelle_titel TEXT,
                 quelle_url TEXT,
                 erstellt_am TEXT NOT NULL
@@ -49,14 +50,20 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_polarisierung ON aussagen(polarisierungsgrad DESC);
         """)
         self.conn.commit()
+        # Migration: kategorie-Spalte zu bestehenden DBs hinzufuegen
+        try:
+            self.conn.execute("ALTER TABLE aussagen ADD COLUMN kategorie TEXT DEFAULT 'polarisierend'")
+            self.conn.commit()
+        except Exception:
+            pass  # Spalte existiert bereits
 
     def speichere_aussage(self, aussage: Aussage) -> int:
         cursor = self.conn.execute(
             """INSERT INTO aussagen
                (politiker, partei, datum, aussage, kontext, thema,
-                polarisierungsgrad, polarisierungsbegruendung,
+                kategorie, polarisierungsgrad, polarisierungsbegruendung,
                 sprachliche_extreme, quelle_titel, quelle_url, erstellt_am)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 aussage.politiker,
                 aussage.partei,
@@ -64,6 +71,7 @@ class Database:
                 aussage.aussage,
                 aussage.kontext,
                 aussage.thema,
+                getattr(aussage, "kategorie", "polarisierend"),
                 aussage.polarisierungsgrad,
                 aussage.polarisierungsbegruendung,
                 json.dumps(aussage.sprachliche_extreme, ensure_ascii=False),

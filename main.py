@@ -102,6 +102,10 @@ def cmd_extract(args):
     print(f"  Max. Aussagen/Protokoll : {args.max_aussagen}")
     if args.limit:
         print(f"  Batch-Limit             : {args.limit} Protokolle")
+    if args.from_date:
+        print(f"  Von Datum               : {args.from_date}")
+    if args.to_date:
+        print(f"  Bis Datum               : {args.to_date}")
     print()
 
     protokoll_db = ProtokollDatabase()
@@ -117,6 +121,12 @@ def cmd_extract(args):
         p for p in alle
         if not aussagen_db.quelle_bereits_verarbeitet(p["id"])
     ]
+
+    # Optional: Datum-Filter
+    if args.from_date:
+        nicht_extrahiert = [p for p in nicht_extrahiert if (p["datum"] or "") >= args.from_date]
+    if args.to_date:
+        nicht_extrahiert = [p for p in nicht_extrahiert if (p["datum"] or "") <= args.to_date]
 
     if not nicht_extrahiert:
         aussagen_db.close()
@@ -135,27 +145,37 @@ def cmd_extract(args):
     verarbeitet     = 0
 
     for i, p in enumerate(zu_verarbeiten, 1):
-        dok_id = p["id"]
-        titel  = p["titel"] or "Unbekannt"
-        url    = p["pdf_url"] or f"https://dip.bundestag.de/vorgang/{dok_id}"
+        dok_id  = p["id"]
+        titel   = p["titel"] or "Unbekannt"
+        pdf_url = p["pdf_url"]
 
         print(f"  [{i}/{len(zu_verarbeiten)}] {titel[:70]}")
 
-        text_parts = [titel]
+        # Fallback-Text falls PDF nicht verfuegbar
+        fallback = titel
         if p.get("abstract"):
-            text_parts.append(p["abstract"])
-        text = "\n\n".join(text_parts)
+            fallback = titel + "\n\n" + p["abstract"]
+
+        # PDF laden und Text extrahieren
+        text, quelle = extractor.lade_protokoll_text(
+            pdf_url=pdf_url,
+            protokoll_id=dok_id,
+            fallback_text=fallback,
+        )
+        print(f"            Quelle: {quelle} | {len(text)} Zeichen")
 
         if len(text.strip()) < 50:
             print("            Zu wenig Text, ueberspringe")
             aussagen_db.markiere_quelle_verarbeitet(dok_id, "plenarprotokoll")
             continue
 
+        quelle_url = pdf_url or f"https://dip.bundestag.de/vorgang/{dok_id}"
+
         try:
             aussagen = extractor.extrahiere_aussagen(
                 text=text,
                 quelle_titel=titel,
-                quelle_url=url,
+                quelle_url=quelle_url,
                 max_aussagen=args.max_aussagen,
             )
             for aussage in aussagen:
@@ -339,6 +359,10 @@ Beispiele:
                            help="Max. Protokolle in diesem Lauf (default: alle ausstehenden)")
     p_extract.add_argument("--max-aussagen", type=int, default=3, metavar="N",
                            help="Max. Aussagen pro Protokoll (default: 3)")
+    p_extract.add_argument("--from-date", default=None, metavar="YYYY-MM-DD",
+                           help="Nur Protokolle ab diesem Datum verarbeiten")
+    p_extract.add_argument("--to-date", default=None, metavar="YYYY-MM-DD",
+                           help="Nur Protokolle bis zu diesem Datum verarbeiten")
     p_extract.set_defaults(func=cmd_extract)
 
     # ── report ─────────────────────────────────────────────────────────────
