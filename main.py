@@ -24,7 +24,7 @@ import webbrowser
 from pathlib import Path
 
 from src.bundestag_api import BundestagAPI, ProtokollDatabase
-from src.extractor import AussagenExtractor
+from src.extractor import AussagenExtractor, lade_xml, parse_reden_aus_xml, XML_CACHE_DIR
 from src.database import Database
 from src.reporter import generiere_html_report
 
@@ -142,51 +142,67 @@ def cmd_extract(args):
     print(f"  In diesem Lauf verarbeiten : {len(zu_verarbeiten)}\n")
 
     gesamt_aussagen = 0
+    gesamt_reden    = 0
     verarbeitet     = 0
 
     for i, p in enumerate(zu_verarbeiten, 1):
-        dok_id  = p["id"]
-        titel   = p["titel"] or "Unbekannt"
-        pdf_url = p["pdf_url"]
+        dok_id      = p["id"]
+        titel       = p["titel"] or "Unbekannt"
+        xml_url     = p["xml_url"]
+        pdf_url     = p["pdf_url"]
+        datum       = p["datum"]
+        wahlperiode = p["wahlperiode"]
 
         print(f"  [{i}/{len(zu_verarbeiten)}] {titel[:70]}")
 
-        # Fallback-Text falls PDF nicht verfuegbar
-        fallback = titel
-        if p.get("abstract"):
-            fallback = titel + "\n\n" + p["abstract"]
-
-        # PDF laden und Text extrahieren
-        text, quelle = extractor.lade_protokoll_text(
-            pdf_url=pdf_url,
-            protokoll_id=dok_id,
-            fallback_text=fallback,
-        )
-        print(f"            Quelle: {quelle} | {len(text)} Zeichen")
-
-        if len(text.strip()) < 50:
-            print("            Zu wenig Text, ueberspringe")
+        # Schritt 1: XML laden und Reden parsen
+        if not xml_url:
+            print(f"    Kein XML verfuegbar, ueberspringe")
             aussagen_db.markiere_quelle_verarbeitet(dok_id, "plenarprotokoll")
             continue
 
-        quelle_url = pdf_url or f"https://dip.bundestag.de/vorgang/{dok_id}"
+        xml_bytes = lade_xml(xml_url, XML_CACHE_DIR / f"{dok_id}.xml")
+        if not xml_bytes:
+            aussagen_db.markiere_quelle_verarbeitet(dok_id, "plenarprotokoll")
+            continue
 
         try:
-            aussagen = extractor.extrahiere_aussagen(
-                text=text,
-                quelle_titel=titel,
-                quelle_url=quelle_url,
-                max_aussagen=args.max_aussagen,
-            )
-            for aussage in aussagen:
-                aussagen_db.speichere_aussage(aussage)
-                gesamt_aussagen += 1
-            aussagen_db.markiere_quelle_verarbeitet(dok_id, "plenarprotokoll")
-            verarbeitet += 1
-            print(f"            {len(aussagen)} Aussage(n) extrahiert")
+            reden = parse_reden_aus_xml(xml_bytes, dok_id, datum, wahlperiode)
         except Exception as e:
-            print(f"            Fehler: {e}")
+            print(f"    XML-Parse-Fehler: {e}")
+            aussagen_db.markiere_quelle_verarbeitet(dok_id, "plenarprotokoll")
             continue
+
+        neu_reden = aussagen_db.speichere_reden(reden)
+        print(f"    XML: {len(reden)} Reden, {neu_reden} neu gespeichert")
+
+        # Schritt 2: Noch nicht analysierte Reden per LLM verarbeiten
+        nicht_analysiert = aussagen_db.get_reden_fuer_protokoll(
+            dok_id, nur_nicht_analysiert=True
+        )
+        protokoll_aussagen = 0
+        quelle_url = pdf_url or f"https://dip.bundestag.de/vorgang/{dok_id}"
+
+        for rede in nicht_analysiert:
+            try:
+                aussagen = extractor.extrahiere_aussagen_aus_rede(
+                    rede=rede,
+                    max_aussagen=args.max_aussagen,
+                    quelle_url=quelle_url,
+                )
+                for aussage in aussagen:
+                    aussagen_db.speichere_aussage(aussage, rede_id=rede["id"])
+                    gesamt_aussagen  += 1
+                    protokoll_aussagen += 1
+                aussagen_db.markiere_rede_analysiert(rede["id"])
+            except Exception as e:
+                print(f"    Fehler bei {rede['politiker']}: {e}")
+                continue
+
+        aussagen_db.markiere_quelle_verarbeitet(dok_id, "plenarprotokoll")
+        gesamt_reden += len(nicht_analysiert)
+        verarbeitet  += 1
+        print(f"    LLM: {len(nicht_analysiert)} Reden -> {protokoll_aussagen} Aussagen")
 
     db_stats = aussagen_db.get_statistiken()
     aussagen_db.close()
@@ -194,6 +210,7 @@ def cmd_extract(args):
     verbleibend = len(nicht_extrahiert) - len(zu_verarbeiten)
     print(f"\nErgebnis:")
     print(f"  Verarbeitet     : {verarbeitet} Protokolle")
+    print(f"  Reden analysiert: {gesamt_reden}")
     print(f"  Neue Aussagen   : {gesamt_aussagen}")
     print(f"  Gesamt in DB    : {db_stats['total_aussagen']} Aussagen")
     if verbleibend:
@@ -234,6 +251,82 @@ def cmd_report(args):
         print("  Report im Browser geoeffnet.")
     else:
         print(f"  Oeffne mit --open oder direkt im Browser.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workflow 4 – PROFILE
+# Analyse-DB -> Politikerprofile
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_profile(args):
+    """
+    Erstellt oder aktualisiert Politikerprofile aus den gesammelten Reden
+    und Aussagen. Pro Politiker: Kernthemen, Kernpositionen, Widersprueche,
+    rhetorische Muster und eine Zusammenfassung.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("  Kein ANTHROPIC_API_KEY gesetzt.")
+        print("  Setze ihn mit: $env:ANTHROPIC_API_KEY = 'sk-ant-...'")
+        sys.exit(1)
+
+    db        = Database()
+    extractor = AussagenExtractor()
+
+    alle_politiker = db.get_alle_politiker(min_reden=args.min_reden)
+
+    if args.politiker:
+        suchbegriff    = args.politiker.lower()
+        alle_politiker = [p for p in alle_politiker if suchbegriff in p["politiker"].lower()]
+
+    if not alle_politiker:
+        print("\n  Keine Politiker gefunden (noch zu wenig Reden extrahiert?).")
+        print("  Fuehre zuerst 'python main.py extract' aus.")
+        db.close()
+        return
+
+    print(f"\n[Workflow 4] Politikerprofile erstellen")
+    print(f"  Politiker gefunden : {len(alle_politiker)}")
+    if args.politiker:
+        print(f"  Filter             : {args.politiker}")
+    print(f"  Mindest-Reden      : {args.min_reden}")
+    print()
+
+    erstellt = 0
+    for i, p_info in enumerate(alle_politiker, 1):
+        name   = p_info["politiker"]
+        partei = p_info["partei"] or "?"
+
+        print(f"  [{i}/{len(alle_politiker)}] {name} ({partei})"
+              f" | {p_info['anzahl_reden']} Reden"
+              f" | {p_info['zeitraum_von']} bis {p_info['zeitraum_bis']}")
+
+        reden   = db.get_reden_fuer_politiker(name)
+        aussagen = db.get_aussagen_fuer_politiker(name)
+
+        if not aussagen and not args.auch_ohne_aussagen:
+            print(f"    Keine Aussagen extrahiert, ueberspringe (--auch-ohne-aussagen zum Erzwingen)")
+            continue
+
+        try:
+            profil = extractor.erstelle_politikerprofil(
+                politiker=name,
+                partei=partei,
+                reden=reden,
+                aussagen=aussagen,
+            )
+            db.speichere_profil(profil)
+            erstellt += 1
+
+            themen = ", ".join(profil.get("kernthemen", [])[:3])
+            wsp    = len(profil.get("widersprueche", []))
+            print(f"    Kernthemen: {themen or '-'} | Widersprueche: {wsp}")
+        except Exception as e:
+            print(f"    Fehler: {e}")
+            continue
+
+    db.close()
+    print(f"\nErgebnis: {erstellt} Profile erstellt/aktualisiert")
+    print(f"Weiter mit: python main.py report")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,16 +411,16 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Workflows (in dieser Reihenfolge ausfuehren):
   1. fetch    Bundestag API abrufen -> Rohdaten-DB
-  2. extract  Rohdaten-DB -> LLM-Extraktion -> Analyse-DB
-  3. report   Analyse-DB -> HTML-Report
+  2. extract  Rohdaten-DB -> LLM-Extraktion -> Analyse-DB (Reden + Aussagen)
+  3. profile  Analyse-DB -> Politikerprofile (Kernthemen, Widersprueche, Rhetorik)
+  4. report   Analyse-DB -> HTML-Report
 
 Beispiele:
   python main.py fetch   --from-date 2024-01-01
-  python main.py fetch   --from-date 2024-01-01 --to-date 2024-03-31
-  python main.py extract
-  python main.py extract --limit 20
+  python main.py extract --from-date 2026-01-01 --limit 5
+  python main.py profile
+  python main.py profile --politiker "Alice Weidel"
   python main.py report  --open
-  python main.py analyse --partei AfD --top 5
         """,
     )
     sub = parser.add_subparsers(dest="mode", metavar="WORKFLOW")
@@ -364,6 +457,20 @@ Beispiele:
     p_extract.add_argument("--to-date", default=None, metavar="YYYY-MM-DD",
                            help="Nur Protokolle bis zu diesem Datum verarbeiten")
     p_extract.set_defaults(func=cmd_extract)
+
+    # ── profile ────────────────────────────────────────────────────────────
+    p_profile = sub.add_parser(
+        "profile",
+        help="[3] Reden + Aussagen -> Politikerprofile",
+        description="Erstellt politische Profile mit Kernthemen, Widerspruechen und rhetorischen Mustern.",
+    )
+    p_profile.add_argument("--politiker", default=None, metavar="NAME",
+                           help="Nur diesen Politiker profilieren (Teilstring reicht)")
+    p_profile.add_argument("--min-reden", type=int, default=2, metavar="N",
+                           help="Mindestanzahl Reden fuer ein Profil (default: 2)")
+    p_profile.add_argument("--auch-ohne-aussagen", action="store_true",
+                           help="Profil auch erstellen wenn keine Aussagen extrahiert wurden")
+    p_profile.set_defaults(func=cmd_profile)
 
     # ── report ─────────────────────────────────────────────────────────────
     p_report = sub.add_parser(

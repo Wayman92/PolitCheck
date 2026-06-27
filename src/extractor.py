@@ -10,12 +10,15 @@ Kategorien:
 
 import json
 import os
+import re
+import xml.etree.ElementTree as ET
 import requests
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, asdict
 
 PDF_CACHE_DIR = Path("data/pdfs")
+XML_CACHE_DIR = Path("data/xml")
 
 
 @dataclass
@@ -35,6 +38,174 @@ class Aussage:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# XML-Hilfsfunktionen (Bundestag Plenarprotokoll)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def lade_xml(url: str, ziel_pfad: Path) -> Optional[bytes]:
+    """Lädt XML von url nach ziel_pfad. Gibt Inhalt als bytes zurück, None bei Fehler."""
+    if ziel_pfad.exists():
+        return ziel_pfad.read_bytes()
+    try:
+        ziel_pfad.parent.mkdir(parents=True, exist_ok=True)
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        ziel_pfad.write_bytes(response.content)
+        return response.content
+    except Exception as e:
+        print(f"    XML-Download fehlgeschlagen: {e}")
+        return None
+
+
+_ZWISCHENRUF_MUSTER = re.compile(r'^\(([^\[]+\[[^\]]+\]):\s*(.+?)\)$', re.DOTALL)
+
+
+def _normalisiere_name(name: str) -> str:
+    """Ersetzt geschuetzte Leerzeichen und normalisiert Whitespace."""
+    return " ".join(name.replace("\xa0", " ").split())
+
+
+def _parse_sprecher(sprecher_raw: str) -> tuple[str, str]:
+    """Extrahiert (name, partei) aus 'Dr. Hans Muster [CDU/CSU]'."""
+    bracket = sprecher_raw.rfind("[")
+    if bracket == -1:
+        return _normalisiere_name(sprecher_raw), ""
+    name   = _normalisiere_name(sprecher_raw[:bracket])
+    partei = sprecher_raw[bracket + 1:].rstrip("]").strip()
+    return name, partei
+
+
+def parse_reden_aus_xml(
+    xml_bytes: bytes,
+    protokoll_id: str,
+    datum: Optional[str] = None,
+    wahlperiode: Optional[int] = None,
+    min_woerter: int = 50,
+) -> list[dict]:
+    """
+    Parst ein Bundestag-Plenarprotokoll-XML.
+
+    Extrahiert:
+    - Reden (typ='rede'): vollstaendige Beitraege, gefiltert auf min_woerter
+    - Zwischenrufe (typ='zwischenruf'): kurze Einwuerfe aus <kommentar>-Elementen,
+      werden an bestehende Reden desselben Politikers angehaengt oder als
+      eigener Eintrag gespeichert (kein Wortlimit).
+
+    Returns: Liste von dicts mit:
+        xml_rede_id, protokoll_id, datum, wahlperiode,
+        politiker, partei, seite, typ, redetext, wortanzahl
+    """
+    root = ET.fromstring(xml_bytes)
+
+    # Seiten-Mapping: xml-rede-id -> Seitennummer (aus Inhaltsverzeichnis)
+    rede_zu_seite: dict[str, int] = {}
+    for xref in root.findall(".//xref"):
+        rid = xref.get("rid")
+        pnr = xref.get("pnr")
+        if rid and pnr:
+            try:
+                rede_zu_seite[rid] = int(pnr)
+            except ValueError:
+                pass
+
+    # Phase 1: Vollstaendige Reden parsen
+    reden_by_id: dict[str, dict] = {}
+    reden_by_politiker: dict[str, dict] = {}
+
+    for rede_elem in root.findall(".//rede"):
+        xml_rede_id = rede_elem.get("id", "")
+        seite = rede_zu_seite.get(xml_rede_id)
+
+        vorname = nachname = partei = ""
+        for p in rede_elem.findall("p"):
+            if p.get("klasse") == "redner":
+                redner_elem = p.find("redner")
+                if redner_elem is not None:
+                    vorname  = redner_elem.findtext("name/vorname") or ""
+                    nachname = redner_elem.findtext("name/nachname") or ""
+                    partei   = redner_elem.findtext("name/fraktion") or ""
+                break
+
+        if not nachname:
+            continue
+
+        politiker = _normalisiere_name(f"{vorname} {nachname}")
+
+        textteile = []
+        for child in rede_elem:
+            if child.tag == "p" and child.get("klasse") != "redner":
+                text = "".join(child.itertext()).strip()
+                if text:
+                    textteile.append(text)
+
+        redetext   = "\n".join(textteile)
+        wortanzahl = len(redetext.split())
+
+        if wortanzahl < min_woerter:
+            continue
+
+        eintrag = {
+            "xml_rede_id":  xml_rede_id,
+            "protokoll_id": protokoll_id,
+            "datum":        datum,
+            "wahlperiode":  wahlperiode,
+            "politiker":    politiker,
+            "partei":       partei,
+            "seite":        seite,
+            "typ":          "rede",
+            "redetext":     redetext,
+            "wortanzahl":   wortanzahl,
+        }
+        reden_by_id[xml_rede_id] = eintrag
+        reden_by_politiker[politiker] = eintrag
+
+    # Phase 2: Zwischenrufe aus <kommentar>-Elementen sammeln
+    zwischenrufe_by_politiker: dict[str, dict] = {}
+
+    for kommentar in root.findall(".//kommentar"):
+        text = "".join(kommentar.itertext()).strip()
+        m = _ZWISCHENRUF_MUSTER.match(text)
+        if not m:
+            continue
+        name, partei = _parse_sprecher(m.group(1))
+        inhalt = m.group(2).strip()
+
+        # Triviale Einwuerfe (< 3 Woerter) ueberspringen
+        if len(inhalt.split()) < 3:
+            continue
+
+        if name not in zwischenrufe_by_politiker:
+            zwischenrufe_by_politiker[name] = {"partei": partei, "texte": []}
+        zwischenrufe_by_politiker[name]["texte"].append(inhalt)
+
+    # Phase 3: Zwischenrufe an bestehende Reden anhaengen oder eigenen Eintrag anlegen
+    for name, zw in zwischenrufe_by_politiker.items():
+        zw_block = "\n\nZwischenrufe:\n" + "\n".join(f"- {t}" for t in zw["texte"])
+
+        if name in reden_by_politiker:
+            # An bestehende Rede anhaengen
+            r = reden_by_politiker[name]
+            r["redetext"]   += zw_block
+            r["wortanzahl"]  = len(r["redetext"].split())
+        else:
+            # Eigener Eintrag ohne Wortlimit
+            redetext = zw_block.strip()
+            reden_by_id[f"zw_{protokoll_id}_{name}"] = {
+                "xml_rede_id":  f"zw_{protokoll_id}_{name.replace(' ', '_')}",
+                "protokoll_id": protokoll_id,
+                "datum":        datum,
+                "wahlperiode":  wahlperiode,
+                "politiker":    name,
+                "partei":       zw["partei"],
+                "seite":        None,
+                "typ":          "zwischenruf",
+                "redetext":     redetext,
+                "wortanzahl":   sum(len(t.split()) for t in zw["texte"]),
+            }
+
+    return list(reden_by_id.values())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,6 +357,179 @@ Antworte NUR mit einem JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
                 print(f"    Konnte Aussage nicht parsen: {e}")
 
         return aussagen
+
+    def extrahiere_aussagen_aus_rede(
+        self,
+        rede: dict,
+        max_aussagen: int = 3,
+        quelle_url: str = "",
+    ) -> list["Aussage"]:
+        """
+        Analysiert eine einzelne Rede eines bekannten Politikers.
+        Politiker, Partei und Datum sind bereits aus dem XML bekannt.
+        """
+        politiker = rede["politiker"]
+        partei    = rede["partei"] or "unbekannt"
+        datum     = rede["datum"] or ""
+        redetext  = rede["redetext"]
+        quelle_titel = f"Plenarprotokoll {datum}"
+
+        prompt = f"""Analysiere diese Rede von {politiker} ({partei}) im Deutschen Bundestag vom {datum}.
+
+REDETEXT:
+{redetext[:8000]}
+
+Extrahiere bis zu {max_aussagen} bemerkenswerte Aussagen aus diesen Kategorien:
+- "polarisierend": Stark vereinfachend, emotionalisierend, spaltend oder reisserisch formuliert
+- "ehrlichkeit_rueckgrat": Ungewoehnlich ehrlich, selbstkritisch oder mutig – auch gegen Parteilinie
+- "widerspruch": Widerspricht bekannten Positionen dieser Partei oder frueheren Aussagen des Politikers
+
+Falls keine bemerkenswerten Aussagen vorhanden sind, gib ein leeres Array zurueck: []
+
+Antworte NUR mit JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
+[
+  {{
+    "politiker": "{politiker}",
+    "partei": "{partei}",
+    "datum": "{datum}",
+    "aussage": "Die genaue Aussage",
+    "kontext": "Kurze Beschreibung des Kontexts (1-2 Saetze)",
+    "thema": "Wirtschaft|Migration|Klimaschutz|Sicherheit|Soziales|Aussenpolitik|Gesundheit|Bildung|Sonstiges",
+    "kategorie": "polarisierend",
+    "polarisierungsgrad": 7,
+    "polarisierungsbegruendung": "Warum ist diese Aussage bemerkenswert?",
+    "sprachliche_extreme": ["auffaellige", "begriffe"],
+    "quelle_titel": "{quelle_titel}",
+    "quelle_url": "{quelle_url}"
+  }}
+]"""
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 2000,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        raw = response.json()["content"][0]["text"].strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+
+        parsed = json.loads(raw)
+        aussagen = []
+        for item in parsed:
+            if "kategorie" not in item:
+                item["kategorie"] = "polarisierend"
+            try:
+                aussagen.append(Aussage(**item))
+            except Exception as e:
+                print(f"    Konnte Aussage nicht parsen: {e}")
+        return aussagen
+
+    def erstelle_politikerprofil(
+        self,
+        politiker: str,
+        partei: str,
+        reden: list[dict],
+        aussagen: list[dict],
+    ) -> dict:
+        """
+        Erstellt ein politisches Profil basierend auf allen Reden und Aussagen
+        eines Politikers. Identifiziert Kernthemen, Kernpositionen, Widersprueche
+        und rhetorische Muster.
+        """
+        # Aussagen chronologisch aufbereiten (max 60 fuer Kontextfenster)
+        aussagen_text = ""
+        for a in aussagen[-60:]:
+            datum    = a.get("datum") or "?"
+            kategorie = a.get("kategorie") or "?"
+            thema    = a.get("thema") or "?"
+            aussage  = a.get("aussage") or ""
+            aussagen_text += f"[{datum} | {kategorie} | {thema}]\n{aussage}\n\n"
+
+        # Redehistorie kompakt (max 30 Eintraege)
+        reden_zeilen = []
+        for r in reden[-30:]:
+            datum = r.get("datum") or "?"
+            wort  = r.get("wortanzahl") or 0
+            typ   = r.get("typ") or "rede"
+            reden_zeilen.append(f"  {datum} | {typ} | {wort} Woerter")
+        reden_uebersicht = "\n".join(reden_zeilen)
+
+        zeitraum_von = reden[0].get("datum")  if reden else None
+        zeitraum_bis = reden[-1].get("datum") if reden else None
+
+        prompt = f"""Erstelle ein politisches Profil von {politiker} ({partei}).
+
+REDEHISTORIE ({len(reden)} Eintraege, {zeitraum_von} bis {zeitraum_bis}):
+{reden_uebersicht}
+
+BEKANNTE AUSSAGEN ({len(aussagen)} gesamt, chronologisch):
+{aussagen_text[:12000]}
+
+Analysiere und antworte NUR mit JSON, ohne Einleitung, ohne Markdown-Backticks:
+{{
+  "kernthemen": ["Thema1", "Thema2"],
+  "kernpositionen": [
+    {{
+      "thema": "Migration",
+      "position": "Kurze praegnante Beschreibung der Position",
+      "begruendung": "Belegt durch welche Aussagen?"
+    }}
+  ],
+  "widersprueche": [
+    {{
+      "aussage1": "Erste Aussage",
+      "datum1": "YYYY-MM-DD",
+      "aussage2": "Spaetere Aussage die widerspricht",
+      "datum2": "YYYY-MM-DD",
+      "erklaerung": "Worin besteht der Widerspruch?"
+    }}
+  ],
+  "rhetorische_muster": [
+    "Beschreibung eines wiederkehrenden Musters (z.B. Feindbildkonstruktion, Zahlenrhetorik)"
+  ],
+  "zusammenfassung": "Kurzes politisches Portrait in 3-5 Saetzen."
+}}
+
+Wichtig:
+- Nur belegte Widersprueche aufnehmen, keine Spekulationen
+- Leere Arrays wenn keine Daten vorhanden
+- Kernthemen nach Haeufigkeit sortieren"""
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 3000,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        raw = response.json()["content"][0]["text"].strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        profil = json.loads(raw)
+
+        profil["politiker"]      = politiker
+        profil["partei"]         = partei
+        profil["anzahl_reden"]   = len(reden)
+        profil["anzahl_aussagen"] = len(aussagen)
+        profil["zeitraum_von"]   = zeitraum_von
+        profil["zeitraum_bis"]   = zeitraum_bis
+        return profil
 
     def bewerte_aussage(self, aussage: "Aussage") -> dict:
         """Bewertet eine einzelne Aussage detaillierter."""

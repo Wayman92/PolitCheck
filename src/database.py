@@ -20,8 +20,29 @@ class Database:
 
     def _create_tables(self):
         self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS reden (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                xml_rede_id   TEXT UNIQUE,
+                protokoll_id  TEXT NOT NULL,
+                datum         TEXT,
+                wahlperiode   INTEGER,
+                politiker     TEXT NOT NULL,
+                partei        TEXT,
+                seite         INTEGER,
+                typ           TEXT DEFAULT 'rede',
+                redetext      TEXT NOT NULL,
+                wortanzahl    INTEGER,
+                analysiert    INTEGER DEFAULT 0,
+                erstellt_am   TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_reden_politiker  ON reden(politiker);
+            CREATE INDEX IF NOT EXISTS idx_reden_protokoll  ON reden(protokoll_id);
+            CREATE INDEX IF NOT EXISTS idx_reden_datum      ON reden(datum);
+
             CREATE TABLE IF NOT EXISTS aussagen (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rede_id INTEGER REFERENCES reden(id),
                 politiker TEXT NOT NULL,
                 partei TEXT,
                 datum TEXT,
@@ -44,27 +65,91 @@ class Database:
                 verarbeitet_am TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_politiker ON aussagen(politiker);
-            CREATE INDEX IF NOT EXISTS idx_partei ON aussagen(partei);
-            CREATE INDEX IF NOT EXISTS idx_thema ON aussagen(thema);
+            CREATE INDEX IF NOT EXISTS idx_politiker    ON aussagen(politiker);
+            CREATE INDEX IF NOT EXISTS idx_partei       ON aussagen(partei);
+            CREATE INDEX IF NOT EXISTS idx_thema        ON aussagen(thema);
             CREATE INDEX IF NOT EXISTS idx_polarisierung ON aussagen(polarisierungsgrad DESC);
+
+            CREATE TABLE IF NOT EXISTS politikerprofile (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                politiker           TEXT NOT NULL UNIQUE,
+                partei              TEXT,
+                kernthemen          TEXT,   -- JSON-Array
+                kernpositionen      TEXT,   -- JSON-Array [{thema, position, begruendung}]
+                widersprueche       TEXT,   -- JSON-Array [{aussage1, datum1, aussage2, datum2, erklaerung}]
+                rhetorische_muster  TEXT,   -- JSON-Array
+                zusammenfassung     TEXT,
+                anzahl_reden        INTEGER,
+                anzahl_aussagen     INTEGER,
+                zeitraum_von        TEXT,
+                zeitraum_bis        TEXT,
+                aktualisiert_am     TEXT NOT NULL
+            );
         """)
         self.conn.commit()
-        # Migration: kategorie-Spalte zu bestehenden DBs hinzufuegen
-        try:
-            self.conn.execute("ALTER TABLE aussagen ADD COLUMN kategorie TEXT DEFAULT 'polarisierend'")
-            self.conn.commit()
-        except Exception:
-            pass  # Spalte existiert bereits
+        # Migrationen fuer bestehende DBs
+        for migration in [
+            "ALTER TABLE aussagen ADD COLUMN kategorie TEXT DEFAULT 'polarisierend'",
+            "ALTER TABLE aussagen ADD COLUMN rede_id INTEGER",
+            "ALTER TABLE reden ADD COLUMN typ TEXT DEFAULT 'rede'",
+        ]:
+            try:
+                self.conn.execute(migration)
+                self.conn.commit()
+            except Exception:
+                pass
 
-    def speichere_aussage(self, aussage: Aussage) -> int:
+    def speichere_reden(self, reden: list[dict]) -> int:
+        """Speichert Reden aus XML-Parsing. Gibt Anzahl neu eingefügter zurück."""
+        neu = 0
+        jetzt = datetime.now().isoformat()
+        for r in reden:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO reden
+                   (xml_rede_id, protokoll_id, datum, wahlperiode, politiker,
+                    partei, seite, typ, redetext, wortanzahl, erstellt_am)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    r["xml_rede_id"], r["protokoll_id"], r["datum"], r["wahlperiode"],
+                    r["politiker"], r["partei"], r["seite"], r.get("typ", "rede"),
+                    r["redetext"], r["wortanzahl"], jetzt,
+                ),
+            )
+            if self.conn.execute("SELECT changes()").fetchone()[0] > 0:
+                neu += 1
+        self.conn.commit()
+        return neu
+
+    def get_reden_fuer_protokoll(
+        self, protokoll_id: str, nur_nicht_analysiert: bool = False
+    ) -> list[dict]:
+        sql = "SELECT * FROM reden WHERE protokoll_id = ?"
+        if nur_nicht_analysiert:
+            sql += " AND analysiert = 0"
+        sql += " ORDER BY seite ASC"
+        rows = self.conn.execute(sql, (protokoll_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_reden_fuer_politiker(self, politiker: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM reden WHERE politiker = ? ORDER BY datum ASC",
+            (politiker,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def markiere_rede_analysiert(self, rede_id: int):
+        self.conn.execute("UPDATE reden SET analysiert = 1 WHERE id = ?", (rede_id,))
+        self.conn.commit()
+
+    def speichere_aussage(self, aussage: Aussage, rede_id: Optional[int] = None) -> int:
         cursor = self.conn.execute(
             """INSERT INTO aussagen
-               (politiker, partei, datum, aussage, kontext, thema,
+               (rede_id, politiker, partei, datum, aussage, kontext, thema,
                 kategorie, polarisierungsgrad, polarisierungsbegruendung,
                 sprachliche_extreme, quelle_titel, quelle_url, erstellt_am)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
+                rede_id,
                 aussage.politiker,
                 aussage.partei,
                 aussage.datum,
@@ -153,6 +238,93 @@ class Database:
             "verarbeitete_quellen": quellen,
             "themen": [dict(t) for t in themen],
         }
+
+    def get_alle_politiker(self, min_reden: int = 1) -> list[dict]:
+        """Gibt alle Politiker zurück die mindestens min_reden Reden haben."""
+        rows = self.conn.execute("""
+            SELECT
+                politiker,
+                partei,
+                COUNT(*)   AS anzahl_reden,
+                MIN(datum) AS zeitraum_von,
+                MAX(datum) AS zeitraum_bis
+            FROM reden
+            GROUP BY politiker
+            HAVING anzahl_reden >= ?
+            ORDER BY anzahl_reden DESC
+        """, (min_reden,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_aussagen_fuer_politiker(self, politiker: str) -> list[dict]:
+        rows = self.conn.execute("""
+            SELECT * FROM aussagen
+            WHERE politiker = ?
+            ORDER BY datum ASC
+        """, (politiker,)).fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            d["sprachliche_extreme"] = json.loads(d["sprachliche_extreme"] or "[]")
+            result.append(d)
+        return result
+
+    def speichere_profil(self, profil: dict) -> None:
+        self.conn.execute("""
+            INSERT INTO politikerprofile
+                (politiker, partei, kernthemen, kernpositionen, widersprueche,
+                 rhetorische_muster, zusammenfassung, anzahl_reden, anzahl_aussagen,
+                 zeitraum_von, zeitraum_bis, aktualisiert_am)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(politiker) DO UPDATE SET
+                partei             = excluded.partei,
+                kernthemen         = excluded.kernthemen,
+                kernpositionen     = excluded.kernpositionen,
+                widersprueche      = excluded.widersprueche,
+                rhetorische_muster = excluded.rhetorische_muster,
+                zusammenfassung    = excluded.zusammenfassung,
+                anzahl_reden       = excluded.anzahl_reden,
+                anzahl_aussagen    = excluded.anzahl_aussagen,
+                zeitraum_von       = excluded.zeitraum_von,
+                zeitraum_bis       = excluded.zeitraum_bis,
+                aktualisiert_am    = excluded.aktualisiert_am
+        """, (
+            profil["politiker"],
+            profil.get("partei"),
+            json.dumps(profil.get("kernthemen", []),         ensure_ascii=False),
+            json.dumps(profil.get("kernpositionen", []),     ensure_ascii=False),
+            json.dumps(profil.get("widersprueche", []),      ensure_ascii=False),
+            json.dumps(profil.get("rhetorische_muster", []), ensure_ascii=False),
+            profil.get("zusammenfassung"),
+            profil.get("anzahl_reden", 0),
+            profil.get("anzahl_aussagen", 0),
+            profil.get("zeitraum_von"),
+            profil.get("zeitraum_bis"),
+            datetime.now().isoformat(),
+        ))
+        self.conn.commit()
+
+    def get_profil(self, politiker: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM politikerprofile WHERE politiker = ?", (politiker,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        for key in ("kernthemen", "kernpositionen", "widersprueche", "rhetorische_muster"):
+            d[key] = json.loads(d[key] or "[]")
+        return d
+
+    def get_alle_profile(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM politikerprofile ORDER BY anzahl_reden DESC"
+        ).fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            for key in ("kernthemen", "kernpositionen", "widersprueche", "rhetorische_muster"):
+                d[key] = json.loads(d[key] or "[]")
+            result.append(d)
+        return result
 
     def close(self):
         self.conn.close()

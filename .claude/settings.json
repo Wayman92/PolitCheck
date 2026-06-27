@@ -5,7 +5,8 @@
       "Bash(py main.py --help)",
       "Bash(py main.py extract --help)",
       "Bash(py main.py report --help)",
-      "Bash(py -c ' *)"
+      "Bash(py -c ' *)",
+      "PowerShell(Start-Process \"c:\\\\Users\\\\janwe\\\\Documents\\\\Jan\\\\Projects\\\\PolitCheck_VS\\\\PolitCheck\\\\output\\\\demo.html\")"
     ]
   }
 }
