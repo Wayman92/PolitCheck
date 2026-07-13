@@ -183,7 +183,33 @@ def cmd_extract(args):
         protokoll_aussagen = 0
         quelle_url = pdf_url or f"https://dip.bundestag.de/vorgang/{dok_id}"
 
+        # Zwischenrufe sofort überspringen, echte Reden sammeln
+        reden_zu_screenen = []
         for rede in nicht_analysiert:
+            if rede.get("typ") == "zwischenruf":
+                aussagen_db.markiere_rede_analysiert(rede["id"])
+            else:
+                reden_zu_screenen.append(rede)
+
+        # Haiku-Vorfilter: Reden in Batches bewerten (Score 1-5)
+        BATCH = extractor._SCREEN_BATCH
+        reden_fuer_sonnet = []
+        for i in range(0, len(reden_zu_screenen), BATCH):
+            batch = reden_zu_screenen[i:i + BATCH]
+            scores = extractor.screen_reden_batch(batch)
+            for rede, score in zip(batch, scores):
+                name_safe = rede["politiker"].encode("ascii", errors="replace").decode("ascii")
+                if score >= 4:
+                    reden_fuer_sonnet.append(rede)
+                else:
+                    aussagen_db.markiere_rede_analysiert(rede["id"])
+                    print(f"    Haiku skip ({score}/5): {name_safe}")
+
+        print(f"    Haiku: {len(reden_zu_screenen)} Reden -> {len(reden_fuer_sonnet)} fuer Sonnet")
+
+        # Sonnet-Analyse nur für Reden mit Score >= 4
+        for rede in reden_fuer_sonnet:
+            name_safe = rede["politiker"].encode("ascii", errors="replace").decode("ascii")
             try:
                 aussagen = extractor.extrahiere_aussagen_aus_rede(
                     rede=rede,
@@ -196,7 +222,7 @@ def cmd_extract(args):
                     protokoll_aussagen += 1
                 aussagen_db.markiere_rede_analysiert(rede["id"])
             except Exception as e:
-                print(f"    Fehler bei {rede['politiker']}: {e}")
+                print(f"    Fehler bei {name_safe}: {e}")
                 continue
 
         aussagen_db.markiere_quelle_verarbeitet(dok_id, "plenarprotokoll")

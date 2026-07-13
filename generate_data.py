@@ -146,9 +146,15 @@ def main():
         "widersprueche": widersprueche,
         "profile":       profile,
     }
+    # JSON fuer HTTP-Fetch
     OUT_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"Exportiert nach {OUT_PATH}:")
+    # JS-Fallback fuer file://-Protokoll (kein CORS-Problem)
+    js_path = OUT_PATH.parent / "data.js"
+    js_content = "window.POLITCHECK_DATA = " + json.dumps(data, ensure_ascii=False) + ";"
+    js_path.write_text(js_content, encoding="utf-8")
+
+    print(f"Exportiert nach {OUT_PATH} + data.js:")
     print(f"  {len(zitate)} Zitate")
     print(f"  {len(widersprueche)} Widersprueche")
     print(f"  {len(profile)} Profile")

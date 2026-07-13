@@ -11,6 +11,7 @@ Kategorien:
 import json
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 import requests
 from pathlib import Path
@@ -249,10 +250,43 @@ def extrahiere_text_aus_pdf(pdf_pfad: Path, max_zeichen: int = 40000) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# JSON-Hilfsfunktion
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_json_robust(raw: str) -> list | dict:
+    """
+    Versucht JSON zu parsen. Bereinigt zuerst Markdown-Blöcke,
+    dann probiert es direkte JSON-Parse. Bei Fehler sucht es per Regex
+    nach dem ersten vollständigen Array/Objekt.
+    """
+    text = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Versuche erstes JSON-Array oder -Objekt zu extrahieren
+    for pattern in (r'(\[[\s\S]*\])', r'(\{[\s\S]*\})'):
+        m = re.search(pattern, text)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Extractor
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AussagenExtractor:
+    _API_URL     = "https://api.anthropic.com/v1/messages"
+    _MODEL       = "claude-sonnet-4-6"
+    _HAIKU_MODEL = "claude-haiku-4-5-20251001"
+    _SCREEN_BATCH = 8    # Reden pro Haiku-Screening-Call
+    _SCREEN_CHARS = 800  # Zeichen pro Rede beim Screening
+    _ANALYSE_CHARS = 3000  # Zeichen pro Rede bei Sonnet-Analyse
+
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
@@ -260,6 +294,63 @@ class AussagenExtractor:
                 "Kein Anthropic API Key gefunden. "
                 "Setze die Umgebungsvariable ANTHROPIC_API_KEY."
             )
+
+    def _api_call(self, prompt: str, max_tokens: int = 2000, model: str = "") -> str:
+        """
+        Sendet Prompt an Claude API. Wartet kurz vor jedem Call,
+        wiederholt bei Rate-Limit-Fehlern (429 / 529) mit Backoff.
+        """
+        headers = {
+            "x-api-key":         self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type":      "application/json",
+        }
+        payload = {
+            "model":      model or self._MODEL,
+            "max_tokens": max_tokens,
+            "messages":   [{"role": "user", "content": prompt}],
+        }
+        time.sleep(0.4)  # Basis-Pause zwischen Calls
+        for attempt in range(4):
+            resp = requests.post(self._API_URL, headers=headers, json=payload, timeout=90)
+            if resp.status_code in (429, 529):
+                wait = 2 ** attempt * 5  # 5s, 10s, 20s, 40s
+                print(f"    Rate-limit ({resp.status_code}), warte {wait}s ...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()["content"][0]["text"].strip()
+        resp.raise_for_status()  # letzter Versuch schlägt durch
+        return ""
+
+    def screen_reden_batch(self, reden_batch: list[dict]) -> list[int]:
+        """
+        Haiku bewertet bis zu _SCREEN_BATCH Reden auf Bemerkungswürdigkeit.
+        Gibt Liste von Scores 1-5 in gleicher Reihenfolge zurück.
+        Score >= 4 → Sonnet-Analyse, Score <= 3 → überspringen.
+        Kostet ~20x weniger als Sonnet.
+        """
+        eintraege = []
+        for i, r in enumerate(reden_batch, 1):
+            text = r["redetext"][:self._SCREEN_CHARS].replace("\n", " ")
+            eintraege.append(f"[{i}] {r['politiker']} ({r.get('partei', '')}): {text}")
+
+        prompt = (
+            f"Bewerte diese {len(reden_batch)} Bundestagsreden auf politische "
+            f"Bemerkungswürdigkeit (1=routinemaessig, 5=sehr bemerkenswert: "
+            f"polarisierend/mutig/widersprüchlich).\n\n"
+            + "\n\n".join(eintraege)
+            + "\n\nAntworte NUR mit JSON-Array der Scores in gleicher Reihenfolge, "
+            "z.B.: [2, 5, 1, 4, 3, 2, 5, 1]"
+        )
+        try:
+            raw    = self._api_call(prompt, max_tokens=80, model=self._HAIKU_MODEL)
+            scores = _parse_json_robust(raw)
+            if isinstance(scores, list) and len(scores) == len(reden_batch):
+                return [int(s) if isinstance(s, (int, float)) else 3 for s in scores]
+        except Exception:
+            pass
+        return [3] * len(reden_batch)  # Fallback: alle mit 3 (Grenzfall, Sonnet entscheidet)
 
     def lade_protokoll_text(
         self,
@@ -325,27 +416,8 @@ Antworte NUR mit einem JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
   }}
 ]"""
 
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 3000,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        raw = data["content"][0]["text"].strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-
-        parsed = json.loads(raw)
+        raw    = self._api_call(prompt, max_tokens=3000)
+        parsed = _parse_json_robust(raw)
 
         aussagen = []
         for item in parsed:
@@ -377,7 +449,7 @@ Antworte NUR mit einem JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
         prompt = f"""Analysiere diese Rede von {politiker} ({partei}) im Deutschen Bundestag vom {datum}.
 
 REDETEXT:
-{redetext[:8000]}
+{redetext[:self._ANALYSE_CHARS]}
 
 Extrahiere bis zu {max_aussagen} bemerkenswerte Aussagen aus diesen Kategorien:
 - "polarisierend": Stark vereinfachend, emotionalisierend, spaltend oder reisserisch formuliert
@@ -404,27 +476,9 @@ Antworte NUR mit JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
   }}
 ]"""
 
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 2000,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        raw = response.json()["content"][0]["text"].strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-
-        parsed = json.loads(raw)
+        raw = self._api_call(prompt, max_tokens=800)
         aussagen = []
-        for item in parsed:
+        for item in _parse_json_robust(raw):
             if "kategorie" not in item:
                 item["kategorie"] = "polarisierend"
             try:
@@ -504,31 +558,17 @@ Wichtig:
 - Leere Arrays wenn keine Daten vorhanden
 - Kernthemen nach Haeufigkeit sortieren"""
 
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 3000,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        raw = response.json()["content"][0]["text"].strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        profil = json.loads(raw)
+        raw   = self._api_call(prompt, max_tokens=3000)
+        profil = _parse_json_robust(raw)
+        if not isinstance(profil, dict):
+            profil = {}
 
-        profil["politiker"]      = politiker
-        profil["partei"]         = partei
-        profil["anzahl_reden"]   = len(reden)
+        profil["politiker"]       = politiker
+        profil["partei"]          = partei
+        profil["anzahl_reden"]    = len(reden)
         profil["anzahl_aussagen"] = len(aussagen)
-        profil["zeitraum_von"]   = zeitraum_von
-        profil["zeitraum_bis"]   = zeitraum_bis
+        profil["zeitraum_von"]    = zeitraum_von
+        profil["zeitraum_bis"]    = zeitraum_bis
         return profil
 
     def bewerte_aussage(self, aussage: "Aussage") -> dict:
@@ -548,22 +588,5 @@ Antworte NUR mit JSON ohne Markdown:
   "aehnliche_aussagen_suchbegriffe": ["Suchbegriffe um aehnliche Faktenchecks zu finden"]
 }}"""
 
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 800,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        raw = data["content"][0]["text"].strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
+        raw = self._api_call(prompt, max_tokens=800)
+        return _parse_json_robust(raw)
