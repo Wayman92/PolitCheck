@@ -189,7 +189,7 @@ class BundestagAPI:
             alle.extend(batch)
 
             if verbose:
-                print(f"  Seite {seite:>3} → {len(batch):>3} Protokolle  (gesamt: {len(alle)})")
+                print(f"  Seite {seite:>3} -> {len(batch):>3} Protokolle  (gesamt: {len(alle)})")
 
             cursor = data.get("cursor")
             if not batch or not cursor or (max_results and len(alle) >= max_results):

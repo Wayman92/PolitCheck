@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 import requests
 from pathlib import Path
 from typing import Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 
 PDF_CACHE_DIR = Path("data/pdfs")
 XML_CACHE_DIR = Path("data/xml")
@@ -33,9 +33,9 @@ class Aussage:
     kategorie: str               # polarisierend | ehrlichkeit_rueckgrat | widerspruch
     polarisierungsgrad: int      # 1-10
     polarisierungsbegruendung: str
-    sprachliche_extreme: list
     quelle_titel: str
     quelle_url: str
+    sprachliche_extreme: list = field(default_factory=list)  # legacy, wird nicht mehr befuellt
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -61,6 +61,14 @@ def lade_xml(url: str, ziel_pfad: Path) -> Optional[bytes]:
 
 
 _ZWISCHENRUF_MUSTER = re.compile(r'^\(([^\[]+\[[^\]]+\]):\s*(.+?)\)$', re.DOTALL)
+
+# Erkennt "erteilt dem Abgeordneten Friedrich Merz (CDU/CSU) einen Ordnungsruf"
+_ORDNUNGSRUF_RE = re.compile(
+    r'erteilt\s+(?:dem\s+Abgeordneten|der\s+Abgeordneten|Herrn|Frau)\s+'
+    r'((?:Dr\.\s+)?[A-ZÄÖÜ]\w+(?:[\s\-][A-ZÄÖÜ]\w+){0,4})'
+    r'(?:\s*\([^)]+\))?\s+einen?\s+Ordnungsruf',
+    re.IGNORECASE,
+)
 
 
 def _normalisiere_name(name: str) -> str:
@@ -206,7 +214,31 @@ def parse_reden_aus_xml(
                 "wortanzahl":   sum(len(t.split()) for t in zw["texte"]),
             }
 
-    return list(reden_by_id.values())
+    # Phase 4: Ordnungsrufe aus <kommentar>-Elementen extrahieren
+    ordnungsrufe = []
+    for kommentar in root.findall(".//kommentar"):
+        text = "".join(kommentar.itertext()).strip()
+        if "Ordnungsruf" not in text:
+            continue
+        m = _ORDNUNGSRUF_RE.search(text)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        # Partei per Nachnamen-Matching aus den Reden dieses Protokolls ermitteln
+        partei = ""
+        nachname = name.split()[-1]
+        for p_name, rede in reden_by_politiker.items():
+            if nachname in p_name:
+                partei = rede.get("partei", "")
+                break
+        ordnungsrufe.append({
+            "protokoll_id": protokoll_id,
+            "datum":        datum or "",
+            "politiker":    name,
+            "partei":       partei,
+        })
+
+    return list(reden_by_id.values()), ordnungsrufe
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,9 +315,59 @@ class AussagenExtractor:
     _API_URL     = "https://api.anthropic.com/v1/messages"
     _MODEL       = "claude-sonnet-4-6"
     _HAIKU_MODEL = "claude-haiku-4-5-20251001"
-    _SCREEN_BATCH = 8    # Reden pro Haiku-Screening-Call
-    _SCREEN_CHARS = 800  # Zeichen pro Rede beim Screening
+    _SCREEN_BATCH  = 8     # Reden pro Haiku-Screening-Call
+    _SCREEN_CHARS  = 800   # Zeichen pro Rede beim Screening
     _ANALYSE_CHARS = 3000  # Zeichen pro Rede bei Sonnet-Analyse
+
+    # Cachjähiger System-Prompt für extrahiere_aussagen_aus_rede (>1024 Token -> Cache-Hit ab 2. Call)
+    _REDE_SYSTEM = (
+        "Du analysierst Reden aus dem Deutschen Bundestag und extrahierst politisch bemerkenswerte Aussagen.\n\n"
+        "DEINE AUFGABE:\n"
+        "Lies den uebergebenen Redetext und extrahiere nur Aussagen die wirklich bemerkenswert sind. "
+        "Im Zweifel lieber weniger extrahieren als zu viel. Wenn keine bemerkenswerte Aussage vorhanden ist, "
+        "gib ein leeres JSON-Array zurueck: []\n\n"
+        "KATEGORIEN (verwende exakt diese Bezeichner im Feld 'kategorie'):\n\n"
+        '"polarisierend"\n'
+        "Aussagen die stark vereinfachen, emotionalisieren, spalten oder reisserisch formuliert sind.\n"
+        "Merkmale: Schwarz-Weiss-Denken ohne Nuancen; Feindbilder konstruieren oder Gruppen gegeneinander ausspielen; "
+        "Angst schueren oder dramatisieren; Fakten verdrehen oder aus dem Kontext reissen; "
+        "uebertriebene oder demagogische Formulierungen.\n"
+        'Beispiele: "Diese Regierung zerstoert unser Land", "Die Einwanderer nehmen uns alles weg"\n\n'
+        '"ehrlichkeit_rueckgrat"\n'
+        "Ungewoehnlich ehrliche, selbstkritische oder mutige Aussagen – auch wenn sie gegen die Parteilinie "
+        "gehen oder politisch riskant sind.\n"
+        "Merkmale: Fehler der eigenen Partei eingestehen; gegen die eigene Parteilinie argumentieren; "
+        "unpopulaere Wahrheiten aussprechen; ungewoehnlich reflektiert oder selbstkritisch sein; "
+        "politisch riskante Positionen vertreten.\n"
+        "Beispiele: Eingestehen dass eine eigene Massnahme gescheitert ist; Kritik an der eigenen Koalition\n\n"
+        '"widerspruch"\n'
+        "Aussagen die bekannten frueheren Positionen des Politikers oder der eigenen Partei direkt widersprechen.\n"
+        "Merkmale: Widerspricht eigenen frueheren Aussagen; widerspricht der offiziellen Parteiposition; "
+        "zeigt klare Inkonsistenz in der politischen Linie.\n\n"
+        "AUSSCHLUSSKRITERIEN (diese Aussagen NICHT extrahieren):\n"
+        "- Reine Verfahrensaussagen: 'Ich beantrage...', 'Wir stimmen zu...'\n"
+        "- Formelle Floskeln: 'Sehr geehrte Damen und Herren...'\n"
+        "- Routinemaessige Positionsbeschreibungen ohne besondere Merkmale\n"
+        "- Sachliche Fakten ohne wertende Komponente\n\n"
+        "AUSGABEFORMAT:\n"
+        "Antworte NUR mit einem JSON-Array. Kein Text davor oder danach. Keine Markdown-Backticks. Kein ```json.\n\n"
+        "Schema fuer jede Aussage im Array:\n"
+        "{\n"
+        '  "politiker": "Vollstaendiger Name des Politikers",\n'
+        '  "partei": "Parteiname (z.B. SPD, CDU/CSU, AfD, Gruene, FDP, Linke, BSW)",\n'
+        '  "datum": "YYYY-MM-DD",\n'
+        '  "aussage": "Die genaue Aussage moeglichst im Wortlaut",\n'
+        '  "kontext": "1-2 Saetze: Worauf bezieht sich die Aussage, was war der Debattenkontext?",\n'
+        '  "thema": "Eines von: Wirtschaft, Migration, Klimaschutz, Sicherheit, Soziales, Aussenpolitik, Gesundheit, Bildung, Sonstiges",\n'
+        '  "kategorie": "polarisierend ODER ehrlichkeit_rueckgrat ODER widerspruch",\n'
+        '  "polarisierungsgrad": 7,\n'
+        '  "polarisierungsbegruendung": "Warum ist diese Aussage bemerkenswert?",\n'
+        '  "quelle_titel": "wird vom System befuellt",\n'
+        '  "quelle_url": "wird vom System befuellt"\n'
+        "}\n\n"
+        "polarisierungsgrad (1-10): 1-3 leicht bemerkenswert; 4-6 klar bemerkenswert; "
+        "7-8 sehr bemerkenswert / viral-Potential; 9-10 historisch bedeutsam oder skandaloes."
+    )
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -295,22 +377,33 @@ class AussagenExtractor:
                 "Setze die Umgebungsvariable ANTHROPIC_API_KEY."
             )
 
-    def _api_call(self, prompt: str, max_tokens: int = 2000, model: str = "") -> str:
+    def _api_call(
+        self,
+        prompt: str,
+        max_tokens: int = 2000,
+        model: str = "",
+        system: str = "",
+    ) -> str:
         """
-        Sendet Prompt an Claude API. Wartet kurz vor jedem Call,
-        wiederholt bei Rate-Limit-Fehlern (429 / 529) mit Backoff.
+        Sendet Prompt an Claude API mit optionalem cachjähigem System-Prompt.
+        Wiederholt bei Rate-Limit-Fehlern (429 / 529) mit Backoff.
         """
         headers = {
             "x-api-key":         self.api_key,
             "anthropic-version": "2023-06-01",
+            "anthropic-beta":    "prompt-caching-2024-07-31",
             "content-type":      "application/json",
         }
-        payload = {
+        payload: dict = {
             "model":      model or self._MODEL,
             "max_tokens": max_tokens,
             "messages":   [{"role": "user", "content": prompt}],
         }
-        time.sleep(0.4)  # Basis-Pause zwischen Calls
+        if system:
+            payload["system"] = [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ]
+        time.sleep(0.4)
         for attempt in range(4):
             resp = requests.post(self._API_URL, headers=headers, json=payload, timeout=90)
             if resp.status_code in (429, 529):
@@ -320,14 +413,14 @@ class AussagenExtractor:
                 continue
             resp.raise_for_status()
             return resp.json()["content"][0]["text"].strip()
-        resp.raise_for_status()  # letzter Versuch schlägt durch
+        resp.raise_for_status()
         return ""
 
     def screen_reden_batch(self, reden_batch: list[dict]) -> list[int]:
         """
         Haiku bewertet bis zu _SCREEN_BATCH Reden auf Bemerkungswürdigkeit.
         Gibt Liste von Scores 1-5 in gleicher Reihenfolge zurück.
-        Score >= 4 → Sonnet-Analyse, Score <= 3 → überspringen.
+        Score >= 4 -> Sonnet-Analyse, Score <= 3 -> überspringen.
         Kostet ~20x weniger als Sonnet.
         """
         eintraege = []
@@ -385,38 +478,12 @@ class AussagenExtractor:
         Extrahiert bemerkenswerte Aussagen aus einem Plenarprotokoll-Text.
         Drei Kategorien: polarisierend, ehrlichkeit_rueckgrat, widerspruch.
         """
-        prompt = f"""Du analysierst ein deutsches Plenarprotokoll des Bundestages und extrahierst die {max_aussagen} bemerkenswertesten Aussagen.
-
-KATEGORIEN (verwende exakt diese Bezeichner im Feld "kategorie"):
-- "polarisierend": Aussagen die stark vereinfachen, emotionalisieren, spalten oder reisserisch formuliert sind
-- "ehrlichkeit_rueckgrat": Ungewoehnlich ehrliche, selbstkritische oder mutige Aussagen - auch wenn sie gegen die Parteilinie gehen oder politisch riskant sind
-- "widerspruch": Aussagen die bekannten Positionen der eigenen Partei oder frueheren Aussagen des Politikers direkt widersprechen
-
-TEXT (Plenarprotokoll):
-{text[:40000]}
-
-Extrahiere die {max_aussagen} interessantesten Aussagen moeglichst verteilt ueber die Kategorien.
-Ignoriere reine Verfahrensaussagen ("Ich beantrage...") und rein formelle Aussagen.
-
-Antworte NUR mit einem JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
-[
-  {{
-    "politiker": "Vollstaendiger Name",
-    "partei": "Parteiname oder leer wenn unbekannt",
-    "datum": "YYYY-MM-DD oder leer wenn unbekannt",
-    "aussage": "Die genaue Aussage",
-    "kontext": "Kurze Beschreibung des Kontexts (1-2 Saetze)",
-    "thema": "Eines von: Wirtschaft, Migration, Klimaschutz, Sicherheit, Soziales, Aussenpolitik, Gesundheit, Bildung, Sonstiges",
-    "kategorie": "polarisierend",
-    "polarisierungsgrad": 7,
-    "polarisierungsbegruendung": "Warum ist diese Aussage bemerkenswert?",
-    "sprachliche_extreme": ["auffaellige", "begriffe"],
-    "quelle_titel": "{quelle_titel}",
-    "quelle_url": "{quelle_url}"
-  }}
-]"""
-
-        raw    = self._api_call(prompt, max_tokens=3000)
+        prompt = (
+            f"Analysiere dieses Plenarprotokoll-Fragment und extrahiere die {max_aussagen} bemerkenswertesten Aussagen.\n\n"
+            f"TEXT:\n{text[:6000]}\n\n"
+            f"Antworte NUR mit JSON-Array. quelle_titel={quelle_titel!r}, quelle_url={quelle_url!r}"
+        )
+        raw    = self._api_call(prompt, max_tokens=1200, system=self._REDE_SYSTEM)
         parsed = _parse_json_robust(raw)
 
         aussagen = []
@@ -446,37 +513,13 @@ Antworte NUR mit einem JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
         redetext  = rede["redetext"]
         quelle_titel = f"Plenarprotokoll {datum}"
 
-        prompt = f"""Analysiere diese Rede von {politiker} ({partei}) im Deutschen Bundestag vom {datum}.
-
-REDETEXT:
-{redetext[:self._ANALYSE_CHARS]}
-
-Extrahiere bis zu {max_aussagen} bemerkenswerte Aussagen aus diesen Kategorien:
-- "polarisierend": Stark vereinfachend, emotionalisierend, spaltend oder reisserisch formuliert
-- "ehrlichkeit_rueckgrat": Ungewoehnlich ehrlich, selbstkritisch oder mutig – auch gegen Parteilinie
-- "widerspruch": Widerspricht bekannten Positionen dieser Partei oder frueheren Aussagen des Politikers
-
-Falls keine bemerkenswerten Aussagen vorhanden sind, gib ein leeres Array zurueck: []
-
-Antworte NUR mit JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
-[
-  {{
-    "politiker": "{politiker}",
-    "partei": "{partei}",
-    "datum": "{datum}",
-    "aussage": "Die genaue Aussage",
-    "kontext": "Kurze Beschreibung des Kontexts (1-2 Saetze)",
-    "thema": "Wirtschaft|Migration|Klimaschutz|Sicherheit|Soziales|Aussenpolitik|Gesundheit|Bildung|Sonstiges",
-    "kategorie": "polarisierend",
-    "polarisierungsgrad": 7,
-    "polarisierungsbegruendung": "Warum ist diese Aussage bemerkenswert?",
-    "sprachliche_extreme": ["auffaellige", "begriffe"],
-    "quelle_titel": "{quelle_titel}",
-    "quelle_url": "{quelle_url}"
-  }}
-]"""
-
-        raw = self._api_call(prompt, max_tokens=800)
+        prompt = (
+            f"Rede von {politiker} ({partei}), Bundestag, {datum}.\n"
+            f"Extrahiere bis zu {max_aussagen} bemerkenswerte Aussagen.\n"
+            f"Verwende als quelle_titel={quelle_titel!r} und quelle_url={quelle_url!r}.\n\n"
+            f"REDETEXT:\n{redetext[:self._ANALYSE_CHARS]}"
+        )
+        raw = self._api_call(prompt, max_tokens=800, system=self._REDE_SYSTEM)
         aussagen = []
         for item in _parse_json_robust(raw):
             if "kategorie" not in item:
@@ -499,9 +542,9 @@ Antworte NUR mit JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
         eines Politikers. Identifiziert Kernthemen, Kernpositionen, Widersprueche
         und rhetorische Muster.
         """
-        # Aussagen chronologisch aufbereiten (max 60 fuer Kontextfenster)
+        # Aussagen chronologisch aufbereiten (max 15 fuer Kontextfenster)
         aussagen_text = ""
-        for a in aussagen[-60:]:
+        for a in aussagen[-15:]:
             datum    = a.get("datum") or "?"
             kategorie = a.get("kategorie") or "?"
             thema    = a.get("thema") or "?"
@@ -525,8 +568,8 @@ Antworte NUR mit JSON-Array, ohne Einleitung, ohne Markdown-Backticks:
 REDEHISTORIE ({len(reden)} Eintraege, {zeitraum_von} bis {zeitraum_bis}):
 {reden_uebersicht}
 
-BEKANNTE AUSSAGEN ({len(aussagen)} gesamt, chronologisch):
-{aussagen_text[:12000]}
+BEKANNTE AUSSAGEN ({len(aussagen)} gesamt, letzte 15 chronologisch):
+{aussagen_text[:6000]}
 
 Analysiere und antworte NUR mit JSON, ohne Einleitung, ohne Markdown-Backticks:
 {{
@@ -558,7 +601,7 @@ Wichtig:
 - Leere Arrays wenn keine Daten vorhanden
 - Kernthemen nach Haeufigkeit sortieren"""
 
-        raw   = self._api_call(prompt, max_tokens=3000)
+        raw   = self._api_call(prompt, max_tokens=1500, model=self._HAIKU_MODEL)
         profil = _parse_json_robust(raw)
         if not isinstance(profil, dict):
             profil = {}
@@ -588,5 +631,5 @@ Antworte NUR mit JSON ohne Markdown:
   "aehnliche_aussagen_suchbegriffe": ["Suchbegriffe um aehnliche Faktenchecks zu finden"]
 }}"""
 
-        raw = self._api_call(prompt, max_tokens=800)
+        raw = self._api_call(prompt, max_tokens=800, model=self._HAIKU_MODEL)
         return _parse_json_robust(raw)

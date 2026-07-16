@@ -75,6 +75,56 @@ def export_widersprueche(conn: sqlite3.Connection, limit: int = 6) -> list[dict]
     return result
 
 
+def export_partei_stats(conn: sqlite3.Connection) -> list[dict]:
+    """Reden, Zwischenrufe und Beleidigungen pro Partei."""
+    rows = conn.execute("""
+        SELECT
+            partei,
+            SUM(CASE WHEN typ != 'zwischenruf' THEN 1 ELSE 0 END) AS reden,
+            SUM(CASE WHEN typ  = 'zwischenruf' THEN 1 ELSE 0 END) AS zwischenrufe
+        FROM reden
+        WHERE partei IS NOT NULL AND partei != ''
+        GROUP BY partei
+        ORDER BY reden DESC
+    """).fetchall()
+
+    result = {
+        r["partei"]: {
+            "partei":        r["partei"],
+            "reden":         r["reden"],
+            "zwischenrufe":  r["zwischenrufe"],
+            "ordnungsrufe":  0,
+        }
+        for r in rows
+    }
+
+    # Ordnungsrufe: Partei per Nachschlage in reden-Tabelle ergänzen
+    ord_rows = conn.execute("""
+        SELECT
+            COALESCE(r.partei, o.partei, '') AS partei,
+            COUNT(*) AS n
+        FROM ordnungsrufe o
+        LEFT JOIN (
+            SELECT politiker, MAX(partei) AS partei
+            FROM reden
+            WHERE partei IS NOT NULL AND partei != ''
+            GROUP BY politiker
+        ) r ON r.politiker = o.politiker
+        WHERE COALESCE(r.partei, o.partei, '') != ''
+        GROUP BY COALESCE(r.partei, o.partei)
+    """).fetchall()
+    for o in ord_rows:
+        if o["partei"] in result:
+            result[o["partei"]]["ordnungsrufe"] = o["n"]
+        else:
+            result[o["partei"]] = {
+                "partei": o["partei"], "reden": 0,
+                "zwischenrufe": 0, "ordnungsrufe": o["n"],
+            }
+
+    return list(result.values())
+
+
 def export_profile(conn: sqlite3.Connection) -> list[dict]:
     """Alle Politikerprofile für die Suchansicht."""
     rows = conn.execute("""
@@ -134,17 +184,19 @@ def main():
 
     conn = load_db(DB_PATH)
 
-    zitate      = export_zitate(conn)
+    zitate        = export_zitate(conn)
     widersprueche = export_widersprueche(conn)
-    profile     = export_profile(conn)
+    profile       = export_profile(conn)
+    partei_stats  = export_partei_stats(conn)
     conn.close()
 
     OUT_PATH.parent.mkdir(exist_ok=True)
     data = {
-        "generiert_am": datetime.now().isoformat(),
+        "generiert_am":  datetime.now().isoformat(),
         "zitate":        zitate,
         "widersprueche": widersprueche,
         "profile":       profile,
+        "partei_stats":  partei_stats,
     }
     # JSON fuer HTTP-Fetch
     OUT_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -158,6 +210,7 @@ def main():
     print(f"  {len(zitate)} Zitate")
     print(f"  {len(widersprueche)} Widersprueche")
     print(f"  {len(profile)} Profile")
+    print(f"  {len(partei_stats)} Parteien (Statistiken)")
 
 
 if __name__ == "__main__":

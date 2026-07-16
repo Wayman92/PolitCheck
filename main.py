@@ -134,6 +134,9 @@ def cmd_extract(args):
         print("  Fuehre zuerst 'python main.py fetch' aus um neue Daten zu laden.")
         return
 
+    # Neueste Protokolle zuerst verarbeiten
+    nicht_extrahiert.sort(key=lambda p: p.get("datum") or "", reverse=True)
+
     # Optional: Batch begrenzen
     zu_verarbeiten = nicht_extrahiert[:args.limit] if args.limit else nicht_extrahiert
 
@@ -144,6 +147,8 @@ def cmd_extract(args):
     gesamt_aussagen = 0
     gesamt_reden    = 0
     verarbeitet     = 0
+    gesamt_kosten   = 0.0
+    budget_stop     = False
 
     for i, p in enumerate(zu_verarbeiten, 1):
         dok_id      = p["id"]
@@ -167,13 +172,16 @@ def cmd_extract(args):
             continue
 
         try:
-            reden = parse_reden_aus_xml(xml_bytes, dok_id, datum, wahlperiode)
+            reden, ordnungsrufe = parse_reden_aus_xml(xml_bytes, dok_id, datum, wahlperiode)
         except Exception as e:
             print(f"    XML-Parse-Fehler: {e}")
             aussagen_db.markiere_quelle_verarbeitet(dok_id, "plenarprotokoll")
             continue
 
         neu_reden = aussagen_db.speichere_reden(reden)
+        if ordnungsrufe:
+            aussagen_db.speichere_ordnungsrufe(ordnungsrufe)
+            print(f"    Ordnungsrufe: {len(ordnungsrufe)} gespeichert")
         print(f"    XML: {len(reden)} Reden, {neu_reden} neu gespeichert")
 
         # Schritt 2: Noch nicht analysierte Reden per LLM verarbeiten
@@ -230,6 +238,18 @@ def cmd_extract(args):
         verarbeitet  += 1
         print(f"    LLM: {len(nicht_analysiert)} Reden -> {protokoll_aussagen} Aussagen")
 
+        # Geschätzte Kosten: Haiku-Batches + Sonnet-Calls
+        kosten_haiku  = (len(reden_zu_screenen) / 8) * 0.006
+        kosten_sonnet = len(reden_fuer_sonnet) * 0.0077
+        gesamt_kosten += kosten_haiku + kosten_sonnet
+        print(f"    Kosten geschätzt: ${gesamt_kosten:.2f}")
+
+        if args.budget and gesamt_kosten >= args.budget:
+            print(f"\n  Budget von ${args.budget:.2f} erreicht – stoppe Extract.")
+            print(f"  Weiter mit: py main.py profile")
+            budget_stop = True
+            break
+
     db_stats = aussagen_db.get_statistiken()
     aussagen_db.close()
 
@@ -241,8 +261,8 @@ def cmd_extract(args):
     print(f"  Gesamt in DB    : {db_stats['total_aussagen']} Aussagen")
     if verbleibend:
         print(f"  Noch ausstehend : {verbleibend} (naechster Lauf: python main.py extract)")
-    else:
-        print(f"\nWeiter mit: python main.py report")
+    elif not budget_stop:
+        print(f"\nWeiter mit: python main.py profile")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,6 +502,8 @@ Beispiele:
                            help="Nur Protokolle ab diesem Datum verarbeiten")
     p_extract.add_argument("--to-date", default=None, metavar="YYYY-MM-DD",
                            help="Nur Protokolle bis zu diesem Datum verarbeiten")
+    p_extract.add_argument("--budget", type=float, default=None, metavar="USD",
+                           help="Geschaetztes API-Kostenlimit in USD (default: unbegrenzt)")
     p_extract.set_defaults(func=cmd_extract)
 
     # ── profile ────────────────────────────────────────────────────────────

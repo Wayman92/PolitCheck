@@ -70,6 +70,16 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_thema        ON aussagen(thema);
             CREATE INDEX IF NOT EXISTS idx_polarisierung ON aussagen(polarisierungsgrad DESC);
 
+            CREATE TABLE IF NOT EXISTS ordnungsrufe (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                protokoll_id TEXT NOT NULL,
+                datum        TEXT,
+                politiker    TEXT,
+                partei       TEXT,
+                erstellt_am  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ordnungsrufe_partei ON ordnungsrufe(partei);
+
             CREATE TABLE IF NOT EXISTS politikerprofile (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 politiker           TEXT NOT NULL UNIQUE,
@@ -136,6 +146,19 @@ class Database:
             (politiker,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def speichere_ordnungsrufe(self, ordnungsrufe: list[dict]) -> int:
+        """Speichert Ordnungsrufe aus XML-Parsing. Gibt Anzahl gespeicherter zurück."""
+        jetzt = datetime.now().isoformat()
+        for o in ordnungsrufe:
+            self.conn.execute(
+                """INSERT INTO ordnungsrufe (protokoll_id, datum, politiker, partei, erstellt_am)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (o["protokoll_id"], o.get("datum", ""), o["politiker"], o.get("partei", ""), jetzt),
+            )
+        if ordnungsrufe:
+            self.conn.commit()
+        return len(ordnungsrufe)
 
     def markiere_rede_analysiert(self, rede_id: int):
         self.conn.execute("UPDATE reden SET analysiert = 1 WHERE id = ?", (rede_id,))
