@@ -488,6 +488,8 @@ class AussagenExtractor:
 
         aussagen = []
         for item in parsed:
+            if not isinstance(item, dict):
+                continue
             if "kategorie" not in item:
                 item["kategorie"] = "polarisierend"
             try:
@@ -522,6 +524,8 @@ class AussagenExtractor:
         raw = self._api_call(prompt, max_tokens=800, system=self._REDE_SYSTEM)
         aussagen = []
         for item in _parse_json_robust(raw):
+            if not isinstance(item, dict):
+                continue
             if "kategorie" not in item:
                 item["kategorie"] = "polarisierend"
             try:

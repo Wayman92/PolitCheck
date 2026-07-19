@@ -11,8 +11,10 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
-DB_PATH  = Path("data/politcheck.db")
-OUT_PATH = Path("output/data.json")
+DB_PATH       = Path("data/politcheck.db")
+OUT_PATH      = Path("output/data.json")
+TEMPLATE_PATH = Path("output/demo.html")
+EXPORT_PATH   = Path("output/politcheck_export.html")
 
 
 def load_db(db_path: Path) -> sqlite3.Connection:
@@ -30,6 +32,7 @@ def export_zitate(conn: sqlite3.Connection, limit: int = 60) -> list[dict]:
             a.quelle_url, a.quelle_titel
         FROM aussagen a
         WHERE a.aussage IS NOT NULL AND LENGTH(a.aussage) > 20
+              AND COALESCE(a.geloescht, 0) = 0
         ORDER BY a.polarisierungsgrad DESC
         LIMIT ?
     """, (limit,)).fetchall()
@@ -140,13 +143,12 @@ def export_profile(conn: sqlite3.Connection) -> list[dict]:
         widersprueche   = json.loads(r["widersprueche"]      or "[]")
         rhet_muster     = json.loads(r["rhetorische_muster"] or "[]")
 
-        # Top-3-Aussagen direkt aus aussagen-Tabelle laden
+        # Alle Aussagen des Politikers, sortiert nach Polarisierung
         top_aussagen = conn.execute("""
             SELECT aussage, datum, polarisierungsgrad, kategorie, quelle_url, thema
             FROM aussagen
-            WHERE politiker = ?
+            WHERE politiker = ? AND COALESCE(geloescht, 0) = 0
             ORDER BY polarisierungsgrad DESC
-            LIMIT 3
         """, (r["politiker"],)).fetchall()
 
         result.append({
@@ -161,7 +163,7 @@ def export_profile(conn: sqlite3.Connection) -> list[dict]:
             "anzahl_aussagen":  r["anzahl_aussagen"] or 0,
             "zeitraum_von":     r["zeitraum_von"] or "",
             "zeitraum_bis":     r["zeitraum_bis"] or "",
-            "top_aussagen": [
+            "aussagen": [
                 {
                     "text":      a["aussage"],
                     "datum":     a["datum"] or "",
@@ -198,15 +200,35 @@ def main():
         "profile":       profile,
         "partei_stats":  partei_stats,
     }
-    # JSON fuer HTTP-Fetch
+    # JSON fuer HTTP-Fetch (Entwicklung)
     OUT_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # JS-Fallback fuer file://-Protokoll (kein CORS-Problem)
     js_path = OUT_PATH.parent / "data.js"
-    js_content = "window.POLITCHECK_DATA = " + json.dumps(data, ensure_ascii=False) + ";"
-    js_path.write_text(js_content, encoding="utf-8")
+    js_path.write_text(
+        "window.POLITCHECK_DATA = " + json.dumps(data, ensure_ascii=False) + ";",
+        encoding="utf-8",
+    )
 
-    print(f"Exportiert nach {OUT_PATH} + data.js:")
+    # Standalone HTML: Daten direkt eingebettet, keine externe Datei noetig
+    if TEMPLATE_PATH.exists():
+        template = TEMPLATE_PATH.read_text(encoding="utf-8")
+        inline_script = (
+            "<script>\nwindow.POLITCHECK_DATA = "
+            + json.dumps(data, ensure_ascii=False)
+            + ";\n</script>"
+        )
+        # Ersetze den externen data.js-Tag durch eingebettete Daten
+        standalone = template.replace(
+            '<script src="data.js" onerror="void 0"></script>',
+            inline_script,
+        )
+        EXPORT_PATH.write_text(standalone, encoding="utf-8")
+        print(f"Standalone HTML: {EXPORT_PATH}")
+    else:
+        print(f"Warnung: Template {TEMPLATE_PATH} nicht gefunden, kein Standalone-Export.")
+
+    print(f"Exportiert nach {OUT_PATH}:")
     print(f"  {len(zitate)} Zitate")
     print(f"  {len(widersprueche)} Widersprueche")
     print(f"  {len(profile)} Profile")

@@ -102,6 +102,7 @@ class Database:
             "ALTER TABLE aussagen ADD COLUMN kategorie TEXT DEFAULT 'polarisierend'",
             "ALTER TABLE aussagen ADD COLUMN rede_id INTEGER",
             "ALTER TABLE reden ADD COLUMN typ TEXT DEFAULT 'rede'",
+            "ALTER TABLE aussagen ADD COLUMN geloescht INTEGER DEFAULT 0",
         ]:
             try:
                 self.conn.execute(migration)
