@@ -79,7 +79,7 @@ def export_widersprueche(conn: sqlite3.Connection, limit: int = 6) -> list[dict]
 
 
 def export_partei_stats(conn: sqlite3.Connection) -> list[dict]:
-    """Reden, Zwischenrufe und Beleidigungen pro Partei."""
+    """Reden und Zwischenrufe pro Partei."""
     rows = conn.execute("""
         SELECT
             partei,
@@ -93,37 +93,12 @@ def export_partei_stats(conn: sqlite3.Connection) -> list[dict]:
 
     result = {
         r["partei"]: {
-            "partei":        r["partei"],
-            "reden":         r["reden"],
-            "zwischenrufe":  r["zwischenrufe"],
-            "ordnungsrufe":  0,
+            "partei":       r["partei"],
+            "reden":        r["reden"],
+            "zwischenrufe": r["zwischenrufe"],
         }
         for r in rows
     }
-
-    # Ordnungsrufe: Partei per Nachschlage in reden-Tabelle ergänzen
-    ord_rows = conn.execute("""
-        SELECT
-            COALESCE(r.partei, o.partei, '') AS partei,
-            COUNT(*) AS n
-        FROM ordnungsrufe o
-        LEFT JOIN (
-            SELECT politiker, MAX(partei) AS partei
-            FROM reden
-            WHERE partei IS NOT NULL AND partei != ''
-            GROUP BY politiker
-        ) r ON r.politiker = o.politiker
-        WHERE COALESCE(r.partei, o.partei, '') != ''
-        GROUP BY COALESCE(r.partei, o.partei)
-    """).fetchall()
-    for o in ord_rows:
-        if o["partei"] in result:
-            result[o["partei"]]["ordnungsrufe"] = o["n"]
-        else:
-            result[o["partei"]] = {
-                "partei": o["partei"], "reden": 0,
-                "zwischenrufe": 0, "ordnungsrufe": o["n"],
-            }
 
     return list(result.values())
 
